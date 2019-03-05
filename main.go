@@ -39,7 +39,7 @@ var (
 		nil, nil)
 	powerDesc = prometheus.NewDesc("power_mw",
 		"Power (mW)",
-		[]string{"mac", "ip"}, nil)
+		[]string{"mac", "ip", "name"}, nil)
 )
 
 func newDataCollector() *dataCollector {
@@ -106,11 +106,13 @@ func (dc *dataCollector) collect(ch chan<- prometheus.Metric) error {
 		info := disc.System.Info
 		rt := disc.EnergyMeter.Realtime
 		log.Printf("(%s, %s) %q: %.1f W", info.MAC, raddr, info.Alias, float64(rt.Power)/1000)
+
+		ip, _, _ := net.SplitHostPort(raddr.String())
+
 		ch <- prometheus.MustNewConstMetric(
 			powerDesc, prometheus.GaugeValue,
 			float64(rt.Power),
-			// XXX: drop port from raddr
-			info.MAC, raddr.String())
+			info.MAC, ip, info.Alias)
 	}
 	return nil
 }
