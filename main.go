@@ -16,7 +16,8 @@ import (
 )
 
 var (
-	port = flag.Int("port", 0, "port to run on")
+	port     = flag.Int("port", 0, "port to run on")
+	scanTime = flag.Duration("scan_time", 2*time.Second, "how long to wait for discovery")
 )
 
 func main() {
@@ -83,8 +84,8 @@ func (dc *dataCollector) collect(ch chan<- prometheus.Metric) error {
 		return fmt.Errorf("conn.WriteToUDP: %v", err)
 	}
 
-	// Wait for any responses over the next 5s.
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// Wait for any responses over the next -scan_time.
+	conn.SetReadDeadline(time.Now().Add(*scanTime))
 	var scratch [4 << 10]byte
 	for {
 		nb, raddr, err := conn.ReadFrom(scratch[:])
