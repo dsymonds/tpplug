@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"time"
 
@@ -75,9 +74,9 @@ func (dc *dataCollector) collect(ch chan<- prometheus.Metric) error {
 		disc := dr.DiscoveryMessage
 		info := disc.System.Info
 		rt := disc.EnergyMeter.Realtime
-		//log.Printf("(%s, %s) %q: %.1f W", info.MAC, raddr, info.Alias, float64(rt.Power)/1000)
+		//log.Printf("(%s, %s) %q: %.1f W", info.MAC, dr.Addr, info.Alias, float64(rt.Power)/1000)
 
-		ip, _, _ := net.SplitHostPort(dr.Addr.String())
+		ip := dr.Addr.IP.String()
 
 		ch <- prometheus.MustNewConstMetric(
 			powerDesc, prometheus.GaugeValue,

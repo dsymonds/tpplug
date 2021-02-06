@@ -58,7 +58,7 @@ func Discover(ctx context.Context) ([]DiscoveryResponse, error) {
 			continue
 		}
 		drs = append(drs, DiscoveryResponse{
-			Addr:             raddr,
+			Addr:             raddr.(*net.UDPAddr),
 			DiscoveryMessage: disc,
 		})
 	}
@@ -66,7 +66,7 @@ func Discover(ctx context.Context) ([]DiscoveryResponse, error) {
 }
 
 type DiscoveryResponse struct {
-	net.Addr
+	Addr *net.UDPAddr
 	DiscoveryMessage
 }
 
