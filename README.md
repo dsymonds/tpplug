@@ -8,5 +8,7 @@ and exports data for use by [Prometheus](https://prometheus.io/).
 
 ## The protocol
 
-(https://github.com/plasticrake/tplink-smarthome-api was a good starting point.)
+https://github.com/plasticrake/tplink-smarthome-api was a good starting point.
+https://www.softscheck.com/en/reverse-engineering-tp-link-hs110/ also had some
+useful info.
 

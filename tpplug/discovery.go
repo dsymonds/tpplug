@@ -8,19 +8,27 @@ import (
 	"net"
 )
 
+func udpConn(ctx context.Context) (*net.UDPConn, error) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	if err != nil {
+		return nil, fmt.Errorf("net.ListenUDP: %v", err)
+	}
+	if d, ok := ctx.Deadline(); ok { // TODO: force a deadline if none provided?
+		conn.SetReadDeadline(d)
+	}
+	return conn, nil
+}
+
 // Discover probes the network for smart plugs.
 // The provided context controls how long to wait for responses;
 // its cancellation or deadline expiry will stop execution of Discover
 // but will not return an error.
 func Discover(ctx context.Context) ([]DiscoveryResponse, error) {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	conn, err := udpConn(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("net.ListenUDP: %v", err)
+		return nil, err
 	}
 	defer conn.Close()
-	if d, ok := ctx.Deadline(); ok { // TODO: force a deadline if none provided?
-		conn.SetReadDeadline(d)
-	}
 
 	msg, err := json.Marshal(&DiscoveryMessage{}) // XXX: really?
 	if err != nil {
@@ -76,7 +84,7 @@ type DiscoveryMessage struct {
 			Model      string `json:"model,omitempty"` // e.g. "HS110(AU)"
 			MAC        string `json:"mac,omitempty"`
 			Alias      string `json:"alias,omitempty"`       // Human-readable name.
-			RelayState int    `json:"relay_state,omitempty"` // 0 = off?
+			RelayState int    `json:"relay_state,omitempty"` // 0 = off, 1 = on
 			// Other keys: sw_ver, hw_ver, type, dev_name, on_time, active_mode
 			//	feature, updating, icon_hash, rssi, led_off, longitude_i, latitude_i
 			//	hwId, fwId, deviceId, oemId, next_action, err_code
