@@ -1,7 +1,7 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -64,50 +64,20 @@ func (dc *dataCollector) Collect(ch chan<- prometheus.Metric) {
 }
 
 func (dc *dataCollector) collect(ch chan<- prometheus.Metric) error {
-	conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	ctx, cancel := context.WithTimeout(context.Background(), *scanTime)
+	defer cancel()
+
+	drs, err := tpplug.Discover(ctx)
 	if err != nil {
-		return fmt.Errorf("net.ListenUDP: %v", err)
+		return err
 	}
-	defer conn.Close()
-
-	msg, err := json.Marshal(&tpplug.DiscoveryMessage{})
-	if err != nil {
-		return fmt.Errorf("encoding discovery request: %v", err)
-	}
-	tpplug.Encrypt(msg)
-
-	dst := &net.UDPAddr{
-		IP:   net.IPv4(255, 255, 255, 255),
-		Port: 9999,
-	}
-	if _, err := conn.WriteToUDP(msg, dst); err != nil {
-		return fmt.Errorf("conn.WriteToUDP: %v", err)
-	}
-
-	// Wait for any responses over the next -scan_time.
-	conn.SetReadDeadline(time.Now().Add(*scanTime))
-	var scratch [4 << 10]byte
-	for {
-		nb, raddr, err := conn.ReadFrom(scratch[:])
-		if err != nil {
-			if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
-				break
-			}
-			return fmt.Errorf("conn.ReadFrom: %v", err)
-		}
-		b := scratch[:nb]
-		tpplug.Decrypt(b)
-
-		var disc tpplug.DiscoveryMessage
-		if err := json.Unmarshal(b, &disc); err != nil {
-			log.Printf("ERROR: Parsing response: %v", err)
-			continue
-		}
+	for _, dr := range drs {
+		disc := dr.DiscoveryMessage
 		info := disc.System.Info
 		rt := disc.EnergyMeter.Realtime
 		//log.Printf("(%s, %s) %q: %.1f W", info.MAC, raddr, info.Alias, float64(rt.Power)/1000)
 
-		ip, _, _ := net.SplitHostPort(raddr.String())
+		ip, _, _ := net.SplitHostPort(dr.Addr.String())
 
 		ch <- prometheus.MustNewConstMetric(
 			powerDesc, prometheus.GaugeValue,

@@ -1,5 +1,75 @@
 package tpplug
 
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+)
+
+// Discover probes the network for smart plugs.
+// The provided context controls how long to wait for responses;
+// its cancellation or deadline expiry will stop execution of Discover
+// but will not return an error.
+func Discover(ctx context.Context) ([]DiscoveryResponse, error) {
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{})
+	if err != nil {
+		return nil, fmt.Errorf("net.ListenUDP: %v", err)
+	}
+	defer conn.Close()
+	if d, ok := ctx.Deadline(); ok { // TODO: force a deadline if none provided?
+		conn.SetReadDeadline(d)
+	}
+
+	msg, err := json.Marshal(&DiscoveryMessage{}) // XXX: really?
+	if err != nil {
+		return nil, fmt.Errorf("encoding discovery request: %v", err)
+	}
+	Encrypt(msg)
+
+	dst := &net.UDPAddr{
+		IP:   net.IPv4(255, 255, 255, 255),
+		Port: 9999,
+	}
+	//log.Printf("sending %d byte message", len(msg))
+	if _, err := conn.WriteToUDP(msg, dst); err != nil {
+		return nil, fmt.Errorf("sending discovery request: %v", err)
+	}
+
+	// Wait for any responses.
+	var drs []DiscoveryResponse
+	var scratch [4 << 10]byte
+	for {
+		nb, raddr, err := conn.ReadFrom(scratch[:])
+		if err != nil {
+			if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+				break
+			}
+			return nil, fmt.Errorf("reading response: %v", err)
+		}
+		b := scratch[:nb]
+		Decrypt(b)
+		//log.Printf("got back %d bytes from %s", nb, raddr)
+
+		var disc DiscoveryMessage
+		if err := json.Unmarshal(b, &disc); err != nil {
+			log.Printf("ERROR: Parsing response: %v", err)
+			continue
+		}
+		drs = append(drs, DiscoveryResponse{
+			Addr:             raddr,
+			DiscoveryMessage: disc,
+		})
+	}
+	return drs, nil
+}
+
+type DiscoveryResponse struct {
+	net.Addr
+	DiscoveryMessage
+}
+
 type DiscoveryMessage struct {
 	System struct {
 		Info struct {
