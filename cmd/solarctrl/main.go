@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"html/template"
+	"io"
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
+	"sync"
 	"time"
 
 	"github.com/dsymonds/tpplug/tpplug"
@@ -18,8 +23,11 @@ import (
 
 var (
 	configFile = flag.String("config_file", "solarctrl.yaml", "configuration `filename`")
+	port       = flag.Int("port", 0, "`port` to serve HTTP (optional)")
 	vFlag      = flag.Bool("v", false, "be verbose")
-	loop       = flag.Duration("loop", 0, "if set, run and evaluate every `period`")
+
+	loop      = flag.Duration("loop", 0, "if set, run and evaluate every `period`")
+	minToggle = flag.Duration("min_toggle", 5*time.Minute, "minimum time between toggles")
 )
 
 func vlogf(format string, args ...interface{}) {
@@ -96,15 +104,25 @@ func main() {
 	}
 	promAPI := promclient.NewAPI(promClient)
 
+	if *port != 0 {
+		go func() {
+			log.Printf("Serving HTTP on port %d", *port)
+			log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
+		}()
+	}
+
+	s := newServer(config, promAPI)
+	http.Handle("/", s)
+
 	// Evaluate at least once.
-	evaluate(context.Background(), config, promAPI)
+	s.evaluate(context.Background())
 
 	if *loop <= 0 {
 		return
 	}
 
 	for range time.NewTicker(*loop).C {
-		evaluate(context.Background(), config, promAPI)
+		s.evaluate(context.Background())
 	}
 }
 
@@ -136,13 +154,47 @@ func solarPower(ctx context.Context, promAPI promclient.API) (Power, error) {
 	return Power(vec[0].Value), nil
 }
 
-func evaluate(ctx context.Context, config Config, promAPI promclient.API) error {
+type server struct {
+	config  Config
+	promAPI promclient.API
+
+	// State updated with each evaluation.
+	mu          sync.Mutex
+	lastLog     bytes.Buffer
+	lastToggles map[string]time.Time // plug name => time
+}
+
+func newServer(config Config, promAPI promclient.API) *server {
+	return &server{
+		config:  config,
+		promAPI: promAPI,
+
+		lastToggles: make(map[string]time.Time),
+	}
+}
+
+func (s *server) evaluate(ctx context.Context) (err error) {
+	var evalLog bytes.Buffer
+	elogf := func(format string, args ...interface{}) {
+		vlogf(format, args...)
+		fmt.Fprintf(&evalLog, format+"\n", args...)
+	}
+	defer func() {
+		if err != nil {
+			elogf("ERROR: %v", err)
+		}
+		s.mu.Lock()
+		s.lastLog = evalLog
+		s.mu.Unlock()
+	}()
+	elogf("Starting evaluation at %v", time.Now().Format(time.RFC3339))
+
 	// Fetch latest solar production.
-	solar, err := solarPower(context.Background(), promAPI)
+	solar, err := solarPower(ctx, s.promAPI)
 	if err != nil {
 		return fmt.Errorf("querying solar power: %w", err)
 	}
-	vlogf("Current solar: %v", solar)
+	elogf("Current solar: %v", solar)
 
 	plugs, err := allPlugs(ctx)
 	if err != nil {
@@ -152,12 +204,12 @@ func evaluate(ctx context.Context, config Config, promAPI promclient.API) error 
 	// Enumerate the plugs. Compute how much spare solar there is,
 	// and collate the discretionary plugs at the same time.
 	var discPlugs []Plug
-	spareSolar := solar - config.BaselineConsumption
+	spareSolar := solar - s.config.BaselineConsumption
 	for _, p := range plugs {
 		spareSolar -= p.Power()
 
 		var sel *TPPlugSelector
-		for _, tps := range config.DiscretionaryPlugs {
+		for _, tps := range s.config.DiscretionaryPlugs {
 			if tps.Matches(p) {
 				sel = &tps
 				break
@@ -174,28 +226,43 @@ func evaluate(ctx context.Context, config Config, promAPI promclient.API) error 
 		}
 		discPlugs = append(discPlugs, p)
 	}
-	vlogf("Spare solar: %v", spareSolar)
+	elogf("Found %d plugs, %d discretionary", len(plugs), len(discPlugs))
+	elogf("Spare solar: %v", spareSolar)
 
 	// See if there are any discretionary plugs to toggle.
 	// TODO: sort them first so this is deterministic.
 	for _, p := range discPlugs {
-		var toggle bool
+		// If this plug was toggled too recently, don't consider it.
+		s.mu.Lock()
+		last, ok := s.lastToggles[p.Alias()]
+		s.mu.Unlock()
+		if ok && time.Since(last) < *minToggle {
+			elogf("Plug %q toggled too recently; leaving it alone", p.Alias())
+			continue
+		}
+
 		if spareSolar < 0 && p.On() {
+			elogf("Turning off %q at %v to save %v", p.Alias(), p.Addr(), p.Power())
 			log.Printf("Turning off %q at %v", p.Alias(), p.Addr())
 			spareSolar += p.Power()
-			toggle = true
-		} else if spareSolar > 0 && !p.On() {
+		} else if spareSolar > p.Power() && !p.On() {
+			elogf("Turning on %q at %v, estimated to use %v", p.Alias(), p.Addr(), p.Power())
 			log.Printf("Turning on %q at %v", p.Alias(), p.Addr())
 			spareSolar -= p.Power()
-			toggle = true
+		} else {
+			continue
 		}
-		if toggle {
-			newState := 1 - p.Raw.System.Info.RelayState
-			err := tpplug.SetRelayState(ctx, p.Addr(), newState)
-			if err != nil {
-				log.Printf("Failed to toggle %q: %v", p.Alias(), err)
-			}
+
+		newState := 1 - p.Raw.System.Info.RelayState
+		err := tpplug.SetRelayState(ctx, p.Addr(), newState)
+		if err != nil {
+			elogf("Failed to toggle %q: %v", p.Alias(), err)
+			log.Printf("Failed to toggle %q: %v", p.Alias(), err)
+			continue
 		}
+		s.mu.Lock()
+		s.lastToggles[p.Alias()] = time.Now()
+		s.mu.Unlock()
 	}
 	return nil
 }
@@ -217,3 +284,63 @@ func allPlugs(ctx context.Context) ([]Plug, error) {
 	}
 	return plugs, nil
 }
+
+func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" {
+		http.NotFound(w, r)
+		return
+	}
+
+	data := struct {
+		LastLog     string
+		LastToggles map[string]time.Time
+	}{
+		LastLog:     "never evaluated",
+		LastToggles: make(map[string]time.Time),
+	}
+	s.mu.Lock()
+	if s.lastLog.Len() > 0 {
+		data.LastLog = s.lastLog.String()
+	}
+	for name, t := range s.lastToggles {
+		data.LastToggles[name] = t
+	}
+	s.mu.Unlock()
+
+	var buf bytes.Buffer
+	if err := serveTmpl.Execute(&buf, data); err != nil {
+		log.Printf("Internal error rendering template: %v", err)
+		http.Error(w, "rendering template: "+err.Error(), 500)
+		return
+	}
+	io.Copy(w, &buf)
+}
+
+var serveTmpl = template.Must(template.New("").Funcs(template.FuncMap{
+	"roughSince": func(t time.Time) string {
+		d := time.Since(t).Truncate(1 * time.Second)
+		return d.String()
+	},
+}).Parse(`
+<!doctype html><html lang="en">
+<head><title>solarctrl</title></head>
+<body>
+
+<h1>solarctrl</h1>
+
+Last evaluation:
+<pre>
+{{.LastLog}}
+</pre>
+
+Last toggles:
+<dl>
+{{range $name, $t := .LastToggles}}
+<dt>{{$name}}</dt>
+<dd>{{roughSince $t}} ago</dd>
+{{end}}
+</dl>
+
+</body>
+</html>
+`))
