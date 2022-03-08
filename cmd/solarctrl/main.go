@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"sync"
 	"time"
 
@@ -39,7 +40,12 @@ func vlogf(format string, args ...interface{}) {
 
 const (
 	// solarQuery is the Prometheus query expression to retrieve the current solar production in Watts as a 1-vector.
-	solarQuery = `sum(power_production_watts{job="solarmon"})`
+	// This uses avg_over_time to help smooth out abrupt changes.
+	solarQuery = `avg_over_time(power_production_watts{job="solarmon"}[5m])`
+
+	// plugQuery is the Prometheus query expression for the recent TPPlug power consumption.
+	// This uses max_over_time to be conservative for high-draw appliances.
+	plugQuery = `max_over_time(power_mw{job="tpplug"}[5m]) / 1000`
 )
 
 type Config struct {
@@ -74,6 +80,7 @@ type Plug struct {
 }
 
 func (p Plug) Addr() *net.UDPAddr { return p.Raw.Addr }
+func (p Plug) MAC() string        { return p.Raw.System.Info.MAC }
 func (p Plug) On() bool           { return p.Raw.System.Info.RelayState == 1 }
 func (p Plug) Power() Power {
 	if p.AssumedPower > 0 {
@@ -154,6 +161,27 @@ func solarPower(ctx context.Context, promAPI promclient.API) (Power, error) {
 	return Power(vec[0].Value), nil
 }
 
+// plugPower fetches the recent TPPlug power consumption, returning a map keyed by MAC address.
+func plugPower(ctx context.Context, promAPI promclient.API) (map[string]Power, error) {
+	v, warns, err := promAPI.Query(ctx, plugQuery, time.Now())
+	if err != nil {
+		return nil, fmt.Errorf("Prometheus query evaluation: %w", err)
+	}
+	for _, w := range warns {
+		vlogf("During Prometheus query evaluation: %s", w)
+	}
+
+	if v.Type() != prommodel.ValVector {
+		return nil, fmt.Errorf("Prometheus query yielded %v, want vector", v.Type())
+	}
+	vec := v.(prommodel.Vector)
+	m := make(map[string]Power, len(vec))
+	for _, s := range vec {
+		m[string(s.Metric["mac"])] = Power(s.Value)
+	}
+	return m, nil
+}
+
 type server struct {
 	config  Config
 	promAPI promclient.API
@@ -174,6 +202,10 @@ func newServer(config Config, promAPI promclient.API) *server {
 }
 
 func (s *server) evaluate(ctx context.Context) (err error) {
+	// Don't spend more than 5m on an evaluation. If something gets stuck,
+	// hopefully it'll be unstuck by the next evaluation.
+	ctx, _ = context.WithTimeout(ctx, 5*time.Minute)
+
 	var evalLog bytes.Buffer
 	elogf := func(format string, args ...interface{}) {
 		vlogf(format, args...)
@@ -189,12 +221,17 @@ func (s *server) evaluate(ctx context.Context) (err error) {
 	}()
 	elogf("Starting evaluation at %v", time.Now().Format(time.RFC3339))
 
-	// Fetch latest solar production.
+	// Fetch latest solar production and TPPlug power consumption.
 	solar, err := solarPower(ctx, s.promAPI)
 	if err != nil {
 		return fmt.Errorf("querying solar power: %w", err)
 	}
 	elogf("Current solar: %v", solar)
+	plugUse, err := plugPower(ctx, s.promAPI)
+	if err != nil {
+		return fmt.Errorf("querying plug power: %w", err)
+	}
+	elogf("Current plug use: %v", plugUse)
 
 	plugs, err := allPlugs(ctx)
 	if err != nil {
@@ -206,6 +243,14 @@ func (s *server) evaluate(ctx context.Context) (err error) {
 	var discPlugs []Plug
 	spareSolar := solar - s.config.BaselineConsumption
 	for _, p := range plugs {
+		// Use the maximum of its current reported power and the Prometheus-measured power
+		// to be conservative for spiky appliances.
+		power := p.Power()
+		if pu := plugUse[p.MAC()]; p.On() && pu > power {
+			elogf("Plug %q nudged up from %v to %v based on recent usage", p.Alias(), power, pu)
+			power = pu
+		}
+
 		spareSolar -= p.Power()
 
 		var sel *TPPlugSelector
@@ -219,7 +264,9 @@ func (s *server) evaluate(ctx context.Context) (err error) {
 			continue
 		}
 
-		if !p.On() {
+		if p.On() {
+			// This plug is on.
+		} else {
 			// This plug is off.
 			// Fill in the configured consumption value so we can use it below.
 			p.AssumedPower = sel.Consumption
