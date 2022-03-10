@@ -68,6 +68,9 @@ func (cfg Config) Discretionary(p Plug) bool {
 type TPPlugSelector struct {
 	Alias       string
 	Consumption Power
+
+	TurnOn  bool `yaml:"turn_on"`
+	TurnOff bool `yaml:"turn_off"`
 }
 
 func (tps TPPlugSelector) Matches(p Plug) bool { return tps.Alias == p.Alias() }
@@ -264,10 +267,18 @@ func (s *server) evaluate(ctx context.Context) (err error) {
 			continue
 		}
 
+		// If the plug is on but can't be turned off (or vice versa),
+		// pretend it isn't discretionary.
 		if p.On() {
 			// This plug is on.
+			if !sel.TurnOff {
+				continue
+			}
 		} else {
 			// This plug is off.
+			if !sel.TurnOn {
+				continue
+			}
 			// Fill in the configured consumption value so we can use it below.
 			p.AssumedPower = sel.Consumption
 		}
