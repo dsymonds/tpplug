@@ -193,6 +193,11 @@ type server struct {
 	mu          sync.Mutex
 	lastLog     bytes.Buffer
 	lastToggles map[string]time.Time // plug name => time
+	seen        map[string]string    // plug MAC => name (discretionary only)
+
+	// Paused plugs.
+	pauseMu sync.Mutex
+	pauses  map[string]time.Time // plug MAC => expiry
 }
 
 func newServer(config Config, promAPI promclient.API) *server {
@@ -201,6 +206,8 @@ func newServer(config Config, promAPI promclient.API) *server {
 		promAPI: promAPI,
 
 		lastToggles: make(map[string]time.Time),
+
+		pauses: make(map[string]time.Time),
 	}
 }
 
@@ -289,13 +296,27 @@ func (s *server) evaluate(ctx context.Context) (err error) {
 
 	// See if there are any discretionary plugs to toggle.
 	// TODO: sort them first so this is deterministic.
+	seen := make(map[string]string)
+	now := time.Now()
 	for _, p := range discPlugs {
+		seen[p.MAC()] = p.Alias()
+
 		// If this plug was toggled too recently, don't consider it.
+		// If it has been paused, also don't consider it.
 		s.mu.Lock()
 		last, ok := s.lastToggles[p.Alias()]
+		pause, pauseOK := s.pauses[p.MAC()]
+		if pause.Before(now) {
+			delete(s.pauses, p.MAC())
+			pauseOK = false
+		}
 		s.mu.Unlock()
 		if ok && time.Since(last) < *minToggle {
 			elogf("Plug %q toggled too recently; leaving it alone", p.Alias())
+			continue
+		}
+		if pauseOK {
+			elogf("Plug %q has control paused until %v", p.Alias(), pause)
 			continue
 		}
 
@@ -322,6 +343,9 @@ func (s *server) evaluate(ctx context.Context) (err error) {
 		s.lastToggles[p.Alias()] = time.Now()
 		s.mu.Unlock()
 	}
+	s.mu.Lock()
+	s.seen = seen
+	s.mu.Unlock()
 	return nil
 }
 
@@ -344,24 +368,41 @@ func allPlugs(ctx context.Context) ([]Plug, error) {
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+	switch r.URL.Path {
+	default:
 		http.NotFound(w, r)
 		return
+	case "/":
+		s.serveFront(w, r)
+	case "/pause":
+		s.servePause(w, r)
 	}
+}
 
+func (s *server) serveFront(w http.ResponseWriter, r *http.Request) {
 	data := struct {
 		LastLog     string
 		LastToggles map[string]time.Time
+		Seen        map[string]string
+		Pauses      map[string]time.Time // name => pause expiry
 	}{
 		LastLog:     "never evaluated",
 		LastToggles: make(map[string]time.Time),
+		Pauses:      make(map[string]time.Time),
 	}
+	now := time.Now()
 	s.mu.Lock()
 	if s.lastLog.Len() > 0 {
 		data.LastLog = s.lastLog.String()
 	}
 	for name, t := range s.lastToggles {
 		data.LastToggles[name] = t
+	}
+	data.Seen = s.seen
+	for mac, name := range s.seen {
+		if t, ok := s.pauses[mac]; ok && t.After(now) {
+			data.Pauses[name] = t
+		}
 	}
 	s.mu.Unlock()
 
@@ -377,6 +418,10 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 var serveTmpl = template.Must(template.New("").Funcs(template.FuncMap{
 	"roughSince": func(t time.Time) string {
 		d := time.Since(t).Truncate(1 * time.Second)
+		return d.String()
+	},
+	"roughUntil": func(t time.Time) string {
+		d := time.Until(t).Truncate(1 * time.Second)
 		return d.String()
 	},
 }).Parse(`
@@ -399,6 +444,49 @@ Last toggles:
 {{end}}
 </dl>
 
+{{with .Pauses}}
+Paused control for these plugs:
+<ul>
+{{range $name, $t := .}}
+<li>{{$name}} ({{roughUntil $t}} left)</li>
+{{end}}
+</ul>
+{{end}}
+
+<form action="/pause" method="POST">
+	<label for="plug-select">Pause control of plug:</label>
+	<select name="plug" id="plug-select">
+		{{range $mac, $name := .Seen}}
+		<option value="{{$mac}}">{{$name}}</option>
+		{{end}}
+	</select>
+	<label for="duration">for:</label>
+	<input type="text" value="2h" name="dur" id="duration">
+	<input type="submit" value="Pause">
+</form>
+
 </body>
 </html>
 `))
+
+func (s *server) servePause(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+	mac := r.PostFormValue("plug")
+	d, err := time.ParseDuration(r.PostFormValue("dur"))
+	if err != nil {
+		http.Error(w, "bad duration: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	until := time.Now().Add(d)
+
+	// In theory we should do an XSRF check here, but the threat model isn't worth the effort.
+
+	s.pauseMu.Lock()
+	s.pauses[mac] = until
+	s.pauseMu.Unlock()
+	log.Printf("Paused %s until %v", mac, until)
+	http.Redirect(w, r, "/", http.StatusSeeOther)
+}
