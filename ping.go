@@ -1,3 +1,4 @@
+//go:build ignore
 // +build ignore
 
 package main
@@ -21,10 +22,11 @@ func main() {
 	}
 	log.Printf("Discovered %d smart plugs:", len(drs))
 	for _, dr := range drs {
+		addr := dr.Addr
 		disc := dr.DiscoveryMessage
 		info := disc.System.Info
 		rt := disc.EnergyMeter.Realtime
-		log.Printf("\t(%s) %q: %.1f W", info.MAC, info.Alias, float64(rt.Power)/1000)
+		log.Printf("\t(%s %s) %q: %.1f W", info.MAC, addr.IP, info.Alias, float64(rt.Power)/1000)
 
 		// Toggle the relay state of a smart plug (on => off or off => on).
 		if strings.HasPrefix(info.Alias, "XYZ") { // TODO: swap this for something relevant.
