@@ -44,6 +44,9 @@ var (
 	powerDesc = prometheus.NewDesc("power_mw",
 		"Power (mW)",
 		[]string{"mac", "ip", "name"}, nil)
+	undiscoveredDesc = prometheus.NewDesc("undiscovered",
+		"Count of undiscovered plugs that nonetheless respond to queries",
+		nil, nil)
 )
 
 func newDataCollector() *dataCollector {
@@ -54,6 +57,7 @@ func newDataCollector() *dataCollector {
 func (dc *dataCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- okDesc
 	ch <- powerDesc
+	ch <- undiscoveredDesc
 }
 
 func (dc *dataCollector) Collect(ch chan<- prometheus.Metric) {
@@ -103,6 +107,7 @@ func (dc *dataCollector) collect(ch chan<- prometheus.Metric) error {
 	dc.mu.Lock()
 	prev := dc.prev
 	dc.mu.Unlock()
+	var undiscovered int
 	for mac, info := range prev {
 		if _, ok := macs[mac]; ok {
 			continue
@@ -118,11 +123,16 @@ func (dc *dataCollector) collect(ch chan<- prometheus.Metric) error {
 		if err == nil {
 			macs[mac] = macInfo{addr: info.addr, t: now}
 			sendPower(state, info.addr)
+			undiscovered++
 		} else {
 			// Keep remembering it for now; it'll age out eventually if it never responds.
 			macs[mac] = info
 		}
 	}
+
+	ch <- prometheus.MustNewConstMetric(
+		undiscoveredDesc, prometheus.GaugeValue,
+		float64(undiscovered))
 
 	// Remember the set of responding plugs and the ones that aren't
 	// responding but did within the history interval.
