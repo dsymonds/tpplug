@@ -71,9 +71,9 @@ func (dc *dataCollector) collect(ch chan<- prometheus.Metric) error {
 		return err
 	}
 	for _, dr := range drs {
-		disc := dr.DiscoveryMessage
-		info := disc.System.Info
-		rt := disc.EnergyMeter.Realtime
+		state := dr.State
+		info := state.System.Info
+		rt := state.EnergyMeter.Realtime
 		//log.Printf("(%s, %s) %q: %.1f W", info.MAC, dr.Addr, info.Alias, float64(rt.Power)/1000)
 
 		ip := dr.Addr.IP.String()

@@ -3,6 +3,7 @@ package tpplug
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -30,55 +31,50 @@ func Discover(ctx context.Context) ([]DiscoveryResponse, error) {
 	}
 	defer conn.Close()
 
-	msg, err := json.Marshal(&DiscoveryMessage{}) // XXX: really?
-	if err != nil {
-		return nil, fmt.Errorf("encoding discovery request: %v", err)
-	}
-	Encrypt(msg)
-
-	dst := &net.UDPAddr{
+	bcast := &net.UDPAddr{
 		IP:   net.IPv4(255, 255, 255, 255),
 		Port: 9999,
 	}
-	//log.Printf("sending %d byte message", len(msg))
-	if _, err := conn.WriteToUDP(msg, dst); err != nil {
-		return nil, fmt.Errorf("sending discovery request: %v", err)
+	if err := writeMsg(conn, bcast, &State{}); err != nil {
+		return nil, err
 	}
 
 	// Wait for any responses.
 	var drs []DiscoveryResponse
 	var scratch [4 << 10]byte
 	for {
-		nb, raddr, err := conn.ReadFrom(scratch[:])
+		var info State
+		raddr, err := readMsg(conn, scratch[:], &info)
 		if err != nil {
-			if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
+			var neterr net.Error
+			if errors.As(err, &neterr) && neterr.Timeout() {
+				// Context timeout reached.
 				break
 			}
-			return nil, fmt.Errorf("reading response: %v", err)
-		}
-		b := scratch[:nb]
-		Decrypt(b)
-		//log.Printf("got back %d bytes from %s", nb, raddr)
-
-		var disc DiscoveryMessage
-		if err := json.Unmarshal(b, &disc); err != nil {
-			log.Printf("ERROR: Parsing response: %v", err)
-			continue
+			var jpe jsonParseError
+			if errors.As(err, &jpe) {
+				// One bogus message. Keep going.
+				log.Printf("ERROR: %v", err)
+				continue
+			}
+			return nil, err
 		}
 		drs = append(drs, DiscoveryResponse{
-			Addr:             raddr.(*net.UDPAddr),
-			DiscoveryMessage: disc,
+			Addr:  raddr,
+			State: info,
 		})
 	}
 	return drs, nil
 }
 
 type DiscoveryResponse struct {
-	Addr *net.UDPAddr
-	DiscoveryMessage
+	Addr  *net.UDPAddr
+	State State
 }
 
-type DiscoveryMessage struct {
+// State represents a plug's state.
+// Its zero value is also used as a query message.
+type State struct {
 	System struct {
 		Info struct {
 			Model      string `json:"model,omitempty"` // e.g. "HS110(AU)"
@@ -98,4 +94,58 @@ type DiscoveryMessage struct {
 			// Other keys: total_wh, err_code
 		} `json:"get_realtime"`
 	} `json:"emeter"`
+}
+
+func Query(ctx context.Context, addr *net.UDPAddr) (State, error) {
+	conn, err := udpConn(ctx)
+	if err != nil {
+		return State{}, err
+	}
+	defer conn.Close()
+
+	if err := writeMsg(conn, addr, &State{}); err != nil {
+		return State{}, err
+	}
+
+	var scratch [4 << 10]byte
+	var state State
+	if _, err := readMsg(conn, scratch[:], &state); err != nil {
+		return State{}, err
+	}
+	return state, nil
+}
+
+// writeMsg JSON encodes and encrypts a message, and sends it to the UDP target.
+func writeMsg(conn *net.UDPConn, dst *net.UDPAddr, msg interface{}) error {
+	b, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("encoding message: %w", err)
+	}
+	Encrypt(b)
+
+	if _, err := conn.WriteToUDP(b, dst); err != nil {
+		return fmt.Errorf("sending message: %w", err)
+	}
+	return nil
+}
+
+type jsonParseError struct {
+	err error
+}
+
+func (jpe jsonParseError) Error() string { return fmt.Sprintf("parsing message: %s", jpe.err.Error()) }
+
+func readMsg(conn *net.UDPConn, scratch []byte, msg interface{}) (raddr *net.UDPAddr, err error) {
+	nb, remoteAddr, err := conn.ReadFrom(scratch)
+	if err != nil {
+		return nil, fmt.Errorf("reading message: %w", err)
+	}
+	b := scratch[:nb]
+	Decrypt(b)
+	raddr = remoteAddr.(*net.UDPAddr)
+
+	if err := json.Unmarshal(b, msg); err != nil {
+		return raddr, jsonParseError{err}
+	}
+	return raddr, nil
 }
