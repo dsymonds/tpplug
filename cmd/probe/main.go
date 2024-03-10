@@ -18,7 +18,15 @@ import (
 
 const usage = `
 Usage:
-	probe [options] <ip>
+	probe [options] <ip> <query>
+
+Example queries:
+	{"system":{"get_sysinfo":null}}
+	{"emeter":{"get_realtime":{}}}
+
+	{"system":{"set_relay_state":{"state":1}}}
+
+	{"count_down":{"get_rules":null}}
 `
 
 func main() {
@@ -27,12 +35,14 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	if flag.NArg() != 1 {
+	if flag.NArg() != 2 {
 		flag.Usage()
 		os.Exit(1)
 	}
 
 	ipStr := flag.Arg(0) // TODO: take port too?
+	req := []byte(flag.Arg(1))
+
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
 		log.Fatalf("Bad IP %q", ipStr)
@@ -45,9 +55,9 @@ func main() {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 
-	raw, err := tpplug.RawQuery(ctx, addr)
+	raw, err := tpplug.RawOp(ctx, addr, req)
 	if err != nil {
-		log.Fatalf("Querying %v: %v", addr, err)
+		log.Fatalf("Probing %v: %v", addr, err)
 	}
 	os.Stdout.Write(raw)
 }
