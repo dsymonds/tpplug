@@ -2,62 +2,54 @@ package tpplug
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 )
 
+type errResponse struct {
+	ErrCode int    `json:"err_code,omitempty"`
+	ErrMsg  string `json:"err_msg"`
+}
+
+func (er errResponse) Err() error {
+	if er.ErrCode == 0 { // Assume this means success.
+		if er.ErrMsg != "" {
+			log.Printf("WARNING: ErrCode=0 but ErrMsg set to %q", er.ErrMsg)
+		}
+		return nil
+	}
+	return fmt.Errorf("error code %d (%s)", er.ErrCode, er.ErrMsg)
+}
+
+type command struct {
+	System *commandSystem `json:"system,omitempty"`
+}
+
+type commandSystem struct {
+	SetRelayState *setRelayState `json:"set_relay_state,omitempty"`
+}
+
+type setRelayState struct {
+	// Input.
+	State int `json:"state"`
+
+	// Output.
+	errResponse
+}
+
 func SetRelayState(ctx context.Context, addr *net.UDPAddr, newState int) error {
-	conn, err := udpConn(ctx)
-	if err != nil {
+	// {"system":{"set_relay_state":{"state":1}}}
+	req := command{
+		System: &commandSystem{
+			SetRelayState: &setRelayState{
+				State: newState,
+			},
+		},
+	}
+	var resp command
+	if err := RawJSONOp(ctx, addr, &req, &resp); err != nil {
 		return err
 	}
-	defer conn.Close()
-
-	// Message structure used for both request and response.
-	var req struct {
-		System struct {
-			SRS struct {
-				// Input.
-				State int `json:"state"`
-				// Output.
-				ErrCode int `json:"err_code"`
-			} `json:"set_relay_state"`
-		} `json:"system"`
-	}
-	req.System.SRS.State = newState
-
-	msg, err := json.Marshal(req)
-	if err != nil {
-		return fmt.Errorf("encoding action request: %v", err)
-	}
-	Encrypt(msg)
-
-	if _, err := conn.WriteToUDP(msg, addr); err != nil {
-		return fmt.Errorf("sending action request: %v", err)
-	}
-
-	// Wait for any response.
-	var scratch [4 << 10]byte
-	for {
-		nb, _, err := conn.ReadFrom(scratch[:])
-		if err != nil {
-			if neterr, ok := err.(net.Error); ok && neterr.Timeout() {
-				break
-			}
-			return fmt.Errorf("reading response: %v", err)
-		}
-		b := scratch[:nb]
-		Decrypt(b)
-
-		if err := json.Unmarshal(b, &req); err != nil {
-			log.Printf("ERROR: Parsing response: %v", err)
-		} else if ec := req.System.SRS.ErrCode; ec != 0 {
-			return fmt.Errorf("response with error code %d", ec)
-		}
-		break
-	}
-
-	return nil
+	return resp.System.SetRelayState.Err()
 }
