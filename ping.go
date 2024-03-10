@@ -58,4 +58,15 @@ func logMsg(addr *net.UDPAddr, state tpplug.State) {
 			log.Printf("\t==> Setting relay state failed: %v", err)
 		}
 	}
+
+	// Turn on a smart plug, but make it go off automatically after a short time.
+	if info.Alias == "XYZ" { // TODO: swap this for something relevant.
+		const dur = 15 * time.Second
+		ctx, _ := context.WithTimeout(context.Background(), 1*time.Second)
+		log.Printf("\t==> Turning on for %v!", dur)
+		err := tpplug.SetRelayTemporarily(ctx, addr, 1, 0, dur)
+		if err != nil {
+			log.Printf("\t==> Temporarily setting relay state failed: %v", err)
+		}
+	}
 }
