@@ -96,23 +96,36 @@ type State struct {
 	} `json:"emeter"`
 }
 
-func Query(ctx context.Context, addr *net.UDPAddr) (State, error) {
+func query(ctx context.Context, addr *net.UDPAddr, dst interface{}) error {
 	conn, err := udpConn(ctx)
 	if err != nil {
-		return State{}, err
+		return err
 	}
 	defer conn.Close()
 
 	if err := writeMsg(conn, addr, &State{}); err != nil {
-		return State{}, err
+		return err
 	}
 
 	var scratch [4 << 10]byte
+	_, err = readMsg(conn, scratch[:], &dst)
+	return err
+}
+
+func Query(ctx context.Context, addr *net.UDPAddr) (State, error) {
 	var state State
-	if _, err := readMsg(conn, scratch[:], &state); err != nil {
+	if err := query(ctx, addr, &state); err != nil {
 		return State{}, err
 	}
 	return state, nil
+}
+
+func RawQuery(ctx context.Context, addr *net.UDPAddr) ([]byte, error) {
+	var out json.RawMessage
+	if err := query(ctx, addr, &out); err != nil {
+		return nil, err
+	}
+	return []byte(out), nil
 }
 
 // writeMsg JSON encodes and encrypts a message, and sends it to the UDP target.
