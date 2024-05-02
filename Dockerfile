@@ -11,10 +11,12 @@ RUN go build -v \
 
 COPY . .
 RUN go build -o tpplug -v
+RUN cd cmd/solarctrl && go build -o solarctrl -v
 
 # -----
 
 FROM alpine:3.18
 
 COPY --from=build /go/src/tpplug/tpplug /
+COPY --from=build /go/src/tpplug/cmd/solarctrl/solarctrl /
 ENTRYPOINT ["/tpplug"]
