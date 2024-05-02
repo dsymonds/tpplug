@@ -12,6 +12,7 @@ import (
 	"net"
 	"net/http"
 	_ "net/http/pprof"
+	"sort"
 	"sync"
 	"time"
 
@@ -43,9 +44,9 @@ const (
 	// This uses avg_over_time to help smooth out abrupt changes.
 	solarQuery = `avg_over_time(power_production_watts{job="solarmon"}[5m])`
 
-	// plugQuery is the Prometheus query expression for the recent TPPlug power consumption.
+	// plugQuery is the Prometheus query expression for the recent smart power consumption.
 	// This uses max_over_time to be conservative for high-draw appliances.
-	plugQuery = `max_over_time(power_mw{job="tpplug"}[5m]) / 1000`
+	plugQuery = `max_over_time(power_w[5m])`
 )
 
 type Config struct {
@@ -164,8 +165,14 @@ func solarPower(ctx context.Context, promAPI promclient.API) (Power, error) {
 	return Power(vec[0].Value), nil
 }
 
-// plugPower fetches the recent TPPlug power consumption, returning a map keyed by MAC address.
-func plugPower(ctx context.Context, promAPI promclient.API) (map[string]Power, error) {
+type plugData struct {
+	Name  string
+	MAC   string // if from job=="tpplug"
+	Power Power
+}
+
+// plugPower fetches the recent smart plug power consumption.
+func plugPower(ctx context.Context, promAPI promclient.API) ([]plugData, error) {
 	v, warns, err := promAPI.Query(ctx, plugQuery, time.Now())
 	if err != nil {
 		return nil, fmt.Errorf("Prometheus query evaluation: %w", err)
@@ -178,11 +185,20 @@ func plugPower(ctx context.Context, promAPI promclient.API) (map[string]Power, e
 		return nil, fmt.Errorf("Prometheus query yielded %v, want vector", v.Type())
 	}
 	vec := v.(prommodel.Vector)
-	m := make(map[string]Power, len(vec))
+	var ds []plugData
 	for _, s := range vec {
-		m[string(s.Metric["mac"])] = Power(s.Value)
+		pd := plugData{
+			Name: string(s.Metric["name"]),
+			// MAC set below.
+			Power: Power(s.Value),
+		}
+		if s.Metric["job"] == "tpplug" {
+			pd.MAC = string(s.Metric["mac"])
+		}
+		ds = append(ds, pd)
 	}
-	return m, nil
+	sort.Slice(ds, func(i, j int) bool { return ds[i].Power > ds[j].Power })
+	return ds, nil
 }
 
 type server struct {
@@ -241,7 +257,20 @@ func (s *server) evaluate(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("querying plug power: %w", err)
 	}
-	elogf("Current plug use: %v", plugUse)
+	tpplugs := make(map[string]Power) // MAC => Power
+	var nonTPUse Power
+	var curUse bytes.Buffer
+	for _, pd := range plugUse {
+		fmt.Fprintf(&curUse, "\t%q", pd.Name)
+		if pd.MAC != "" {
+			fmt.Fprintf(&curUse, " (%s)", pd.MAC)
+			tpplugs[pd.MAC] = pd.Power
+		} else {
+			nonTPUse += pd.Power
+		}
+		fmt.Fprintf(&curUse, " %v\n", pd.Power)
+	}
+	elogf("Current plug use:\n%s", curUse.String())
 
 	plugs, err := allPlugs(ctx)
 	if err != nil {
@@ -256,7 +285,7 @@ func (s *server) evaluate(ctx context.Context) (err error) {
 		// Use the maximum of its current reported power and the Prometheus-measured power
 		// to be conservative for spiky appliances.
 		power := p.Power()
-		if pu := plugUse[p.MAC()]; p.On() && pu > power {
+		if pu := tpplugs[p.MAC()]; p.On() && pu > power {
 			elogf("Plug %q nudged up from %v to %v based on recent usage", p.Alias(), power, pu)
 			power = pu
 		}
@@ -291,7 +320,11 @@ func (s *server) evaluate(ctx context.Context) (err error) {
 		}
 		discPlugs = append(discPlugs, p)
 	}
-	elogf("Found %d plugs, %d discretionary", len(plugs), len(discPlugs))
+	elogf("Found %d TPPlugs plugs (of %d total), %d discretionary", len(plugs), len(plugUse), len(discPlugs))
+	if nonTPUse > 0 {
+		elogf("Non-TPPlugs are using %v", nonTPUse)
+		spareSolar -= nonTPUse
+	}
 	elogf("Spare solar: %v", spareSolar)
 
 	// See if there are any discretionary plugs to toggle.

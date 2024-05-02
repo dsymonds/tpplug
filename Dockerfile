@@ -15,7 +15,7 @@ RUN cd cmd/solarctrl && go build -o solarctrl -v
 
 # -----
 
-FROM alpine:3.18
+FROM alpine:3.18 AS runtime
 
 COPY --from=build /go/src/tpplug/tpplug /
 COPY --from=build /go/src/tpplug/cmd/solarctrl/solarctrl /
