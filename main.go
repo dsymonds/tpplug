@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +25,7 @@ var (
 	port     = flag.Int("port", 0, "port to run on")
 	scanTime = flag.Duration("scan_time", 2*time.Second, "how long to wait for discovery")
 	history  = flag.Duration("history", 10*time.Minute, "how long to keep trying to contact a plug that stopped responding")
+	ignore   = flag.String("ignore", "", "comma-separated list of MACs to ignore")
 )
 
 func main() {
@@ -39,6 +41,8 @@ func main() {
 
 // dataCollector implements prometheus.Collector.
 type dataCollector struct {
+	ignore map[string]bool // static after newDataCollector
+
 	mu   sync.Mutex
 	last time.Time
 	prev map[string]macInfo
@@ -57,7 +61,14 @@ var (
 )
 
 func newDataCollector() *dataCollector {
-	dc := &dataCollector{}
+	dc := &dataCollector{
+		ignore: make(map[string]bool),
+	}
+	if *ignore != "" {
+		for _, mac := range strings.Split(*ignore, ",") {
+			dc.ignore[mac] = true
+		}
+	}
 	return dc
 }
 
@@ -93,6 +104,10 @@ func (dc *dataCollector) collect(ch chan<- prometheus.Metric) error {
 		info := state.System.Info
 		rt := state.EnergyMeter.Realtime
 		//log.Printf("(%s, %s) %q: %.1f W", info.MAC, addr, info.Alias, float64(rt.Power)/1000)
+
+		if dc.ignore[info.MAC] {
+			return
+		}
 
 		ch <- prometheus.MustNewConstMetric(
 			powerDesc, prometheus.GaugeValue,
@@ -157,12 +172,15 @@ func (dc *dataCollector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Last    time.Time
 		Plugs   map[string]macInfo
 		PlugSeq []string // MACs
+		Ignore  map[string]bool
 	}
 
 	dc.mu.Lock()
 	data.Last = dc.last
 	data.Plugs = dc.prev
 	dc.mu.Unlock()
+
+	data.Ignore = dc.ignore
 
 	// Build list of plug MACs, ordered by IP.
 	for mac := range data.Plugs {
@@ -221,6 +239,7 @@ Last scan: <b>{{if .Last.IsZero}}never{{else}}{{roughSince .Last}}{{end}}</b>
 	<td>{{$p.State.System.Info.Model}}</td>
 	<td>{{$p.State.System.Info.Alias}}</td>
 	<td>{{printf "%.1f" (mWtoW $p.State.EnergyMeter.Realtime.Power)}}W</td>
+	<td>{{if (index $.Ignore $p.State.System.Info.MAC)}}<b>ignored</b>{{end}}</td>
 </tr>
 {{end}}
 </table>
