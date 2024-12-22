@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
+	"html/template"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -25,8 +29,10 @@ var (
 func main() {
 	flag.Parse()
 
-	prometheus.MustRegister(newDataCollector())
+	dc := newDataCollector()
+	prometheus.MustRegister(dc)
 
+	http.Handle("/", dc)
 	http.Handle("/metrics", promhttp.Handler())
 	log.Fatal(http.ListenAndServe(fmt.Sprintf(":%d", *port), nil))
 }
@@ -34,6 +40,7 @@ func main() {
 // dataCollector implements prometheus.Collector.
 type dataCollector struct {
 	mu   sync.Mutex
+	last time.Time
 	prev map[string]macInfo
 }
 
@@ -73,8 +80,9 @@ func (dc *dataCollector) Collect(ch chan<- prometheus.Metric) {
 
 // macInfo represents a previously seen plug.
 type macInfo struct {
-	addr *net.UDPAddr
-	t    time.Time
+	Addr  *net.UDPAddr
+	Seen  time.Time
+	State tpplug.State
 }
 
 func (dc *dataCollector) collect(ch chan<- prometheus.Metric) error {
@@ -99,7 +107,7 @@ func (dc *dataCollector) collect(ch chan<- prometheus.Metric) error {
 	macs := make(map[string]macInfo)
 	now := time.Now()
 	for _, dr := range drs {
-		macs[dr.State.System.Info.MAC] = macInfo{addr: dr.Addr, t: now}
+		macs[dr.State.System.Info.MAC] = macInfo{Addr: dr.Addr, Seen: now, State: dr.State}
 		sendPower(dr.State, dr.Addr)
 	}
 
@@ -112,17 +120,17 @@ func (dc *dataCollector) collect(ch chan<- prometheus.Metric) error {
 		if _, ok := macs[mac]; ok {
 			continue
 		}
-		if now.Sub(info.t) > *history {
+		if now.Sub(info.Seen) > *history {
 			continue
 		}
 
 		// TODO: Controllable?
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		state, err := tpplug.Query(ctx, info.addr)
+		state, err := tpplug.Query(ctx, info.Addr)
 		cancel()
 		if err == nil {
-			macs[mac] = macInfo{addr: info.addr, t: now}
-			sendPower(state, info.addr)
+			macs[mac] = macInfo{Addr: info.Addr, Seen: now, State: state}
+			sendPower(state, info.Addr)
 			undiscovered++
 		} else {
 			// Keep remembering it for now; it'll age out eventually if it never responds.
@@ -137,8 +145,86 @@ func (dc *dataCollector) collect(ch chan<- prometheus.Metric) error {
 	// Remember the set of responding plugs and the ones that aren't
 	// responding but did within the history interval.
 	dc.mu.Lock()
+	dc.last = now
 	dc.prev = macs
 	dc.mu.Unlock()
 
 	return nil
 }
+
+func (dc *dataCollector) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var data struct {
+		Last    time.Time
+		Plugs   map[string]macInfo
+		PlugSeq []string // MACs
+	}
+
+	dc.mu.Lock()
+	data.Last = dc.last
+	data.Plugs = dc.prev
+	dc.mu.Unlock()
+
+	// Build list of plug MACs, ordered by IP.
+	for mac := range data.Plugs {
+		data.PlugSeq = append(data.PlugSeq, mac)
+	}
+	sort.Slice(data.PlugSeq, func(i, j int) bool {
+		// lazy sort by IPv4
+		ipi := data.Plugs[data.PlugSeq[i]].Addr.IP.To4()
+		ipj := data.Plugs[data.PlugSeq[j]].Addr.IP.To4()
+		if ipi == nil || ipj == nil {
+			return false
+		}
+		for n := 0; n < 4; n++ {
+			if ipi[n] != ipj[n] {
+				return ipi[n] < ipj[n]
+			}
+		}
+		return false
+	})
+
+	var buf bytes.Buffer
+	if err := frontTmpl.Execute(&buf, data); err != nil {
+		http.Error(w, "internal error: "+err.Error(), 500)
+		return
+	}
+	io.Copy(w, &buf)
+}
+
+var frontTmpl = template.Must(template.New("").Funcs(template.FuncMap{
+	"mWtoW": func(x int) float64 { return float64(x) / 1000 },
+	"roughSince": func(t time.Time) string {
+		d := time.Since(t).Truncate(1 * time.Second)
+		return d.String()
+	},
+}).Parse(`
+<!doctype html><html lang="en">
+<head><title>tpplug</title></head>
+<body>
+
+<h1>tpplug</h1>
+
+Last scan: <b>{{if .Last.IsZero}}never{{else}}{{roughSince .Last}}{{end}}</b>
+
+<table>
+<tr>
+	<th>MAC</th><th>IP:port</th><th>seen</th>
+	<th>model</th><th>name</th><th>last power</th>
+</tr>
+{{range .PlugSeq}}
+{{$p := index $.Plugs .}}
+<tr>
+	{{/* TODO: $p.State.System.Info.RelayState (0=off, 1=on) */}}
+	<td>{{$p.State.System.Info.MAC}}</td>
+	<td>{{$p.Addr}}</td>
+	<td>{{roughSince $p.Seen}}</td>
+	<td>{{$p.State.System.Info.Model}}</td>
+	<td>{{$p.State.System.Info.Alias}}</td>
+	<td>{{printf "%.1f" (mWtoW $p.State.EnergyMeter.Realtime.Power)}}W</td>
+</tr>
+{{end}}
+</table>
+
+</body>
+</html>
+`))
