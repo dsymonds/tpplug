@@ -54,45 +54,34 @@ type Config struct {
 
 	BaselineConsumption Power `yaml:"baseline_consumption"`
 
-	DiscretionaryPlugs []TPPlugSelector `yaml:"discretionary_plugs"`
+	DiscretionaryPlugs []TPPlugConfig `yaml:"discretionary_plugs"`
 }
 
-func (cfg Config) Discretionary(p Plug) bool {
-	for _, tps := range cfg.DiscretionaryPlugs {
-		if tps.Matches(p) {
-			return true
-		}
-	}
-	return false
-}
-
-type TPPlugSelector struct {
+type TPPlugConfig struct {
 	Alias       string
+	IP          string
 	Consumption Power
 
 	TurnOn  bool `yaml:"turn_on"`
 	TurnOff bool `yaml:"turn_off"`
 }
 
-func (tps TPPlugSelector) Matches(p Plug) bool { return tps.Alias == p.Alias() }
-
-type Plug struct {
-	Raw tpplug.DiscoveryResponse
+type TPPlug struct {
+	dp    discPlug
+	state tpplug.State
 
 	// Assumed overrides the power in Raw.
 	AssumedPower Power
 }
 
-func (p Plug) Addr() *net.UDPAddr { return p.Raw.Addr }
-func (p Plug) MAC() string        { return p.Raw.System.Info.MAC }
-func (p Plug) On() bool           { return p.Raw.System.Info.RelayState == 1 }
-func (p Plug) Power() Power {
-	if p.AssumedPower > 0 {
-		return p.AssumedPower
+func (tp TPPlug) Addr() *net.UDPAddr { return tp.dp.addr }
+func (tp TPPlug) On() bool           { return tp.state.System.Info.RelayState == 1 }
+func (tp TPPlug) Power() Power {
+	if tp.AssumedPower > 0 {
+		return tp.AssumedPower
 	}
-	return Power(p.Raw.EnergyMeter.Realtime.Power / 1000) // mw -> W
+	return Power(tp.state.EnergyMeter.Realtime.Power / 1000) // mw -> W
 }
-func (p Plug) Alias() string { return p.Raw.System.Info.Alias }
 
 func main() {
 	flag.Parse()
@@ -122,7 +111,10 @@ func main() {
 		}()
 	}
 
-	s := newServer(config, promAPI)
+	s, err := newServer(config, promAPI)
+	if err != nil {
+		log.Fatalf("Initialising server: %v", err)
+	}
 	http.Handle("/", s)
 
 	// Evaluate at least once.
@@ -203,28 +195,50 @@ func plugPower(ctx context.Context, promAPI promclient.API) ([]plugData, error) 
 
 type server struct {
 	config  Config
+	dps     []discPlug
 	promAPI promclient.API
 
 	// State updated with each evaluation.
 	mu          sync.Mutex
 	lastLog     bytes.Buffer
 	lastToggles map[string]time.Time // plug name => time
-	seen        map[string]string    // plug MAC => name (discretionary only)
+	seen        []string             // plug names (discretionary only)
 
 	// Paused plugs.
 	pauseMu sync.Mutex
-	pauses  map[string]time.Time // plug MAC => expiry
+	pauses  map[string]time.Time // plug name => expiry
 }
 
-func newServer(config Config, promAPI promclient.API) *server {
+type discPlug struct {
+	addr *net.UDPAddr
+	cfg  TPPlugConfig
+}
+
+func newServer(config Config, promAPI promclient.API) (*server, error) {
+	var dps []discPlug
+	for _, tp := range config.DiscretionaryPlugs {
+		ip := net.ParseIP(tp.IP)
+		if ip == nil {
+			return nil, fmt.Errorf("bad IP %q", tp.IP)
+		}
+		dps = append(dps, discPlug{
+			addr: &net.UDPAddr{
+				IP:   ip,
+				Port: 9999, // fixed port
+			},
+			cfg: tp,
+		})
+	}
+
 	return &server{
 		config:  config,
+		dps:     dps,
 		promAPI: promAPI,
 
 		lastToggles: make(map[string]time.Time),
 
 		pauses: make(map[string]time.Time),
-	}
+	}, nil
 }
 
 func (s *server) evaluate(ctx context.Context) (err error) {
@@ -253,151 +267,121 @@ func (s *server) evaluate(ctx context.Context) (err error) {
 		return fmt.Errorf("querying solar power: %w", err)
 	}
 	elogf("Current solar: %v", solar)
-	plugUse, err := plugPower(ctx, s.promAPI)
+	plugs, err := plugPower(ctx, s.promAPI)
 	if err != nil {
 		return fmt.Errorf("querying plug power: %w", err)
 	}
-	tpplugs := make(map[string]Power) // MAC => Power
-	var nonTPUse Power
+	plugIndex := make(map[string]*plugData) // keyed by name
 	var curUse bytes.Buffer
-	for _, pd := range plugUse {
-		fmt.Fprintf(&curUse, "\t%q", pd.Name)
-		if pd.MAC != "" {
-			fmt.Fprintf(&curUse, " (%s)", pd.MAC)
-			tpplugs[pd.MAC] = pd.Power
-		} else {
-			nonTPUse += pd.Power
-		}
-		fmt.Fprintf(&curUse, " %v\n", pd.Power)
+	for i, pd := range plugs {
+		plugIndex[pd.Name] = &plugs[i]
+		fmt.Fprintf(&curUse, "\t%q %v\n", pd.Name, pd.Power)
 	}
 	elogf("Current plug use:\n%s", curUse.String())
 
-	plugs, err := allPlugs(ctx)
-	if err != nil {
-		return err
+	// Query discretionary plugs to check their state.
+	discPlugs := make(map[string]TPPlug) // keyed by alias
+	for _, dp := range s.dps {
+		name := dp.cfg.Alias
+		state, err := tpplug.Query(ctx, dp.addr)
+		if err != nil {
+			elogf("Querying discretionary plug %q (%v): %v", name, dp.addr, err)
+			continue
+		}
+		tp := TPPlug{
+			dp:    dp,
+			state: state,
+		}
+		if pd, ok := plugIndex[name]; ok {
+			// Use the maximum of its current reported power and the Prometheus-measured power
+			// to be conservative for spiky appliances.
+			if state.System.Info.RelayState == 1 && pd.Power > tp.Power() {
+				elogf("Plug %q nudged up from %v to %v based on recent usage", name, tp.Power(), pd.Power)
+				tp.AssumedPower = pd.Power
+			}
+		} else {
+			// Not fatal, but suspicious.
+			elogf("WARNING: discretionary plug at %v has configured alias %q that wasn't reported via Prometheus", dp.addr, name)
+		}
+		discPlugs[name] = tp
+		elogf("Discretionary plug %q -> %v", name, tp.Power())
 	}
 
-	// Enumerate the plugs. Compute how much spare solar there is,
-	// and collate the discretionary plugs at the same time.
-	var discPlugs []Plug
+	// Enumerate the plugs. Compute how much spare solar there is.
 	spareSolar := solar - s.config.BaselineConsumption
 	for _, p := range plugs {
-		// Use the maximum of its current reported power and the Prometheus-measured power
-		// to be conservative for spiky appliances.
-		power := p.Power()
-		if pu := tpplugs[p.MAC()]; p.On() && pu > power {
-			elogf("Plug %q nudged up from %v to %v based on recent usage", p.Alias(), power, pu)
-			power = pu
-		}
+		spareSolar -= p.Power
+	}
+	elogf("Found %d plugs, %d discretionary", len(plugs), len(discPlugs))
+	elogf("Spare solar: %v", spareSolar)
 
-		spareSolar -= p.Power()
+	// See if there are any discretionary plugs to toggle.
+	// TODO: sort them first so this is deterministic.
+	var seen []string // names
+	now := time.Now()
+	for _, tp := range discPlugs {
+		name := tp.dp.cfg.Alias
+		seen = append(seen, name)
 
-		var sel *TPPlugSelector
-		for _, tps := range s.config.DiscretionaryPlugs {
-			if tps.Matches(p) {
-				sel = &tps
-				break
-			}
+		// If this plug was toggled too recently, don't consider it.
+		// If it has been paused, also don't consider it.
+		s.mu.Lock()
+		last, ok := s.lastToggles[name]
+		pause, pauseOK := s.pauses[name]
+		if pause.Before(now) {
+			delete(s.pauses, name)
+			pauseOK = false
 		}
-		if sel == nil {
+		s.mu.Unlock()
+		if ok && time.Since(last) < *minToggle {
+			elogf("Plug %q toggled too recently; leaving it alone", name)
+			continue
+		}
+		if pauseOK {
+			elogf("Plug %q has control paused until %v", name, pause)
 			continue
 		}
 
 		// If the plug is on but can't be turned off (or vice versa),
 		// pretend it isn't discretionary.
-		if p.On() {
-			// This plug is on.
-			if !sel.TurnOff {
-				continue
-			}
-		} else {
-			// This plug is off.
-			if !sel.TurnOn {
-				continue
-			}
-			// Fill in the configured consumption value so we can use it below.
-			p.AssumedPower = sel.Consumption
-		}
-		discPlugs = append(discPlugs, p)
-	}
-	elogf("Found %d TPPlugs plugs (of %d total), %d discretionary", len(plugs), len(plugUse), len(discPlugs))
-	if nonTPUse > 0 {
-		elogf("Non-TPPlugs are using %v", nonTPUse)
-		spareSolar -= nonTPUse
-	}
-	elogf("Spare solar: %v", spareSolar)
-
-	// See if there are any discretionary plugs to toggle.
-	// TODO: sort them first so this is deterministic.
-	seen := make(map[string]string)
-	now := time.Now()
-	for _, p := range discPlugs {
-		seen[p.MAC()] = p.Alias()
-
-		// If this plug was toggled too recently, don't consider it.
-		// If it has been paused, also don't consider it.
-		s.mu.Lock()
-		last, ok := s.lastToggles[p.Alias()]
-		pause, pauseOK := s.pauses[p.MAC()]
-		if pause.Before(now) {
-			delete(s.pauses, p.MAC())
-			pauseOK = false
-		}
-		s.mu.Unlock()
-		if ok && time.Since(last) < *minToggle {
-			elogf("Plug %q toggled too recently; leaving it alone", p.Alias())
+		if tp.On() && !tp.dp.cfg.TurnOff {
 			continue
 		}
-		if pauseOK {
-			elogf("Plug %q has control paused until %v", p.Alias(), pause)
+		if !tp.On() && !tp.dp.cfg.TurnOn {
 			continue
 		}
 
-		if spareSolar < 0 && p.On() {
-			elogf("Turning off %q at %v to save %v", p.Alias(), p.Addr(), p.Power())
-			log.Printf("Turning off %q at %v", p.Alias(), p.Addr())
-			spareSolar += p.Power()
-		} else if spareSolar > p.Power() && !p.On() {
-			elogf("Turning on %q at %v, estimated to use %v", p.Alias(), p.Addr(), p.Power())
-			log.Printf("Turning on %q at %v", p.Alias(), p.Addr())
-			spareSolar -= p.Power()
+		power := tp.Power()
+		if !tp.On() && tp.dp.cfg.Consumption > power {
+			power = tp.dp.cfg.Consumption
+		}
+		if spareSolar < 0 && tp.On() {
+			elogf("Turning off %q at %v to save %v", name, tp.Addr(), power)
+			log.Printf("Turning off %q at %v", name, tp.Addr())
+			spareSolar += tp.Power()
+		} else if spareSolar > tp.Power() && !tp.On() {
+			elogf("Turning on %q at %v, estimated to use %v", name, tp.Addr(), power)
+			log.Printf("Turning on %q at %v", name, tp.Addr())
+			spareSolar -= tp.Power()
 		} else {
 			continue
 		}
 
-		newState := 1 - p.Raw.System.Info.RelayState
-		err := tpplug.SetRelayState(ctx, p.Addr(), newState)
+		newState := 1 - tp.state.System.Info.RelayState
+		err := tpplug.SetRelayState(ctx, tp.Addr(), newState)
 		if err != nil {
-			elogf("Failed to toggle %q: %v", p.Alias(), err)
-			log.Printf("Failed to toggle %q: %v", p.Alias(), err)
+			elogf("Failed to toggle %q: %v", name, err)
+			log.Printf("Failed to toggle %q: %v", name, err)
 			continue
 		}
 		s.mu.Lock()
-		s.lastToggles[p.Alias()] = time.Now()
+		s.lastToggles[name] = time.Now()
 		s.mu.Unlock()
 	}
 	s.mu.Lock()
 	s.seen = seen
 	s.mu.Unlock()
 	return nil
-}
-
-func allPlugs(ctx context.Context) ([]Plug, error) {
-	// Discover all plugs, with a 5s timeout.
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	drs, err := tpplug.Discover(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("discovering plugs: %w", err)
-	}
-	var plugs []Plug
-	for _, dr := range drs {
-		plugs = append(plugs, Plug{
-			Raw: dr,
-		})
-	}
-	return plugs, nil
 }
 
 func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -416,7 +400,7 @@ func (s *server) serveFront(w http.ResponseWriter, r *http.Request) {
 	data := struct {
 		LastLog     string
 		LastToggles map[string]time.Time
-		Seen        map[string]string
+		Seen        []string             // names
 		Pauses      map[string]time.Time // name => pause expiry
 	}{
 		LastLog:     "never evaluated",
@@ -432,8 +416,8 @@ func (s *server) serveFront(w http.ResponseWriter, r *http.Request) {
 		data.LastToggles[name] = t
 	}
 	data.Seen = s.seen
-	for mac, name := range s.seen {
-		if t, ok := s.pauses[mac]; ok && t.After(now) {
+	for _, name := range s.seen {
+		if t, ok := s.pauses[name]; ok && t.After(now) {
 			data.Pauses[name] = t
 		}
 	}
@@ -489,8 +473,8 @@ Paused control for these plugs:
 <form action="/pause" method="POST">
 	<label for="plug-select">Pause control of plug:</label>
 	<select name="plug" id="plug-select">
-		{{range $mac, $name := .Seen}}
-		<option value="{{$mac}}">{{$name}}</option>
+		{{range .Seen}}
+		<option value="{{.}}">{{.}}</option>
 		{{end}}
 	</select>
 	<label for="duration">for:</label>
@@ -507,7 +491,7 @@ func (s *server) servePause(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
-	mac := r.PostFormValue("plug")
+	name := r.PostFormValue("plug")
 	d, err := time.ParseDuration(r.PostFormValue("dur"))
 	if err != nil {
 		http.Error(w, "bad duration: "+err.Error(), http.StatusBadRequest)
@@ -518,8 +502,8 @@ func (s *server) servePause(w http.ResponseWriter, r *http.Request) {
 	// In theory we should do an XSRF check here, but the threat model isn't worth the effort.
 
 	s.pauseMu.Lock()
-	s.pauses[mac] = until
+	s.pauses[name] = until
 	s.pauseMu.Unlock()
-	log.Printf("Paused %s until %v", mac, until)
+	log.Printf("Paused %q until %v", name, until)
 	http.Redirect(w, r, "/", http.StatusSeeOther)
 }
