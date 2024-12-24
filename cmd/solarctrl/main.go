@@ -358,11 +358,11 @@ func (s *server) evaluate(ctx context.Context) (err error) {
 		if spareSolar < 0 && tp.On() {
 			elogf("Turning off %q at %v to save %v", name, tp.Addr(), power)
 			log.Printf("Turning off %q at %v", name, tp.Addr())
-			spareSolar += tp.Power()
-		} else if spareSolar > tp.Power() && !tp.On() {
+			spareSolar += power
+		} else if spareSolar > power && !tp.On() {
 			elogf("Turning on %q at %v, estimated to use %v", name, tp.Addr(), power)
 			log.Printf("Turning on %q at %v", name, tp.Addr())
-			spareSolar -= tp.Power()
+			spareSolar -= power
 		} else {
 			continue
 		}

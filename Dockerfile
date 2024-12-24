@@ -17,6 +17,10 @@ RUN cd cmd/solarctrl && go build -o solarctrl -v
 
 FROM alpine:3.18 AS runtime
 
+# Run everything by default in the Sydney timezone.
+RUN apk add --no-cache tzdata
+ENV TZ=Australia/Sydney
+
 COPY --from=build /go/src/tpplug/tpplug /
 COPY --from=build /go/src/tpplug/cmd/solarctrl/solarctrl /
 ENTRYPOINT ["/tpplug"]
