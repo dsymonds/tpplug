@@ -3,7 +3,7 @@ module github.com/dsymonds/tpplug/cmd/solarctrl
 go 1.17
 
 require (
-	github.com/dsymonds/tpplug v0.0.0-20241223230758-a496acda1787
+	github.com/dsymonds/tpplug v0.0.0-20241225080319-a9d1b2995096
 	github.com/prometheus/client_golang v1.11.1
 	github.com/prometheus/common v0.26.0
 	gopkg.in/yaml.v2 v2.4.0

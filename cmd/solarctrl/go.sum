@@ -13,8 +13,8 @@ github.com/cespare/xxhash/v2 v2.1.1/go.mod h1:VGX0DQ3Q6kWi7AoAeZDth3/j3BFtOZR5XL
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/dsymonds/tpplug v0.0.0-20241223230758-a496acda1787 h1:y2IZQiymhvJiqRtwV5Ar/KqKhL60TSW/nkrktEERS+U=
-github.com/dsymonds/tpplug v0.0.0-20241223230758-a496acda1787/go.mod h1:n4FyBhIM4RjCuked03F4z6UgplJuhNUt58fXvoVW33g=
+github.com/dsymonds/tpplug v0.0.0-20241225080319-a9d1b2995096 h1:OBiE2fn9+cn8TykbUcV09UjHwn7lbIPwFRy9kwBusAs=
+github.com/dsymonds/tpplug v0.0.0-20241225080319-a9d1b2995096/go.mod h1:n4FyBhIM4RjCuked03F4z6UgplJuhNUt58fXvoVW33g=
 github.com/go-kit/kit v0.8.0/go.mod h1:xBxKIO96dXMWWy0MnWVtmwkA9/13aqxPnvrjFYMA2as=
 github.com/go-kit/kit v0.9.0/go.mod h1:xBxKIO96dXMWWy0MnWVtmwkA9/13aqxPnvrjFYMA2as=
 github.com/go-kit/log v0.1.0/go.mod h1:zbhenjAZHb184qTLMA9ZjW7ThYL0H2mk7Q6pNt4vbaY=
