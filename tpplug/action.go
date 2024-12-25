@@ -102,7 +102,7 @@ func setRelay(ctx context.Context, addr *net.UDPAddr, newValue, revertValue int,
 }
 
 func SetRelayState(ctx context.Context, addr *net.UDPAddr, newState int) error {
-	return setRelay(ctx, addr, 1, 0, 0)
+	return setRelay(ctx, addr, newState, 0, 0)
 }
 
 func SetRelayTemporarily(ctx context.Context, addr *net.UDPAddr, newValue, revertValue int, revertDur time.Duration) error {
